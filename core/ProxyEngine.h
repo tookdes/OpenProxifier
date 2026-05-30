@@ -28,6 +28,20 @@ typedef enum {
     PROXY_TYPE_HTTP = 1
 } ProxyType;
 
+// Proxy info (per-rule or global)
+#define PROXY_HOST_MAX 256
+#define PROXY_USER_MAX 64
+#define PROXY_PASS_MAX 64
+
+typedef struct ProxyInfo {
+    ProxyType type;
+    char      host[PROXY_HOST_MAX];
+    uint16_t  port;
+    char      username[PROXY_USER_MAX];
+    char      password[PROXY_PASS_MAX];
+    bool      has_proxy;
+} ProxyInfo;
+
 // Callback function types
 typedef void (*LogCallback)(const char* message);
 typedef void (*ConnectionCallback)(const char* process, uint32_t pid,
@@ -45,7 +59,9 @@ void ProxyEngine_SetDnsViaProxy(bool enable);
 
 // Rule management
 uint32_t ProxyEngine_AddRule(const char* process, const char* hosts,
-                             const char* ports, RuleProtocol proto, RuleAction action);
+                             const char* ports, RuleProtocol proto, RuleAction action,
+                             const ProxyInfo* proxy);
+bool ProxyEngine_GetGlobalProxy(ProxyInfo* out);
 bool ProxyEngine_RemoveRule(uint32_t rule_id);
 bool ProxyEngine_EnableRule(uint32_t rule_id, bool enable);
 void ProxyEngine_ClearRules(void);

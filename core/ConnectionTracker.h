@@ -1,6 +1,7 @@
 #ifndef CONNECTION_TRACKER_H
 #define CONNECTION_TRACKER_H
 
+#include "ProxyEngine.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <windows.h>
@@ -18,6 +19,7 @@ typedef struct ConnectionInfo {
     uint16_t orig_dest_port;
     bool is_ipv6;
     bool is_tracked;
+    ProxyInfo proxy;              // per-connection proxy
     struct ConnectionInfo* next;
 } ConnectionInfo;
 
@@ -27,11 +29,16 @@ void ConnectionTracker_Cleanup(void);
 
 // Add a connection to track (IPv4)
 void ConnectionTracker_Add(uint16_t src_port, uint32_t src_ip,
-                           uint32_t dest_ip, uint16_t dest_port);
+                           uint32_t dest_ip, uint16_t dest_port,
+                           const ProxyInfo* proxy);
 
 // Add a connection to track (IPv6)
 void ConnectionTracker_AddIPv6(uint16_t src_port, uint32_t src_ip,
-                               const uint8_t* dest_ipv6, uint16_t dest_port);
+                               const uint8_t* dest_ipv6, uint16_t dest_port,
+                               const ProxyInfo* proxy);
+
+// Get proxy info for a tracked connection
+bool ConnectionTracker_GetProxy(uint16_t src_port, ProxyInfo* proxy);
 
 // Get original destination by source port (IPv4)
 bool ConnectionTracker_Get(uint16_t src_port, uint32_t* dest_ip, uint16_t* dest_port);

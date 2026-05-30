@@ -73,9 +73,6 @@ static uint16_t g_active_tcp_port = LOCAL_TCP_PORT_BASE;
 static uint16_t g_active_udp_port = LOCAL_UDP_PORT_BASE;
 
 // External references
-extern char g_proxy_host[256];
-extern uint16_t g_proxy_port;
-extern int g_proxy_type;
 extern bool g_dns_via_proxy;
 extern LogCallback g_log_callback;
 extern ConnectionCallback g_connection_callback;
@@ -345,47 +342,48 @@ bool PacketProcessor_IsBroadcastOrMulticast(uint32_t ip) {
     return false;
 }
 
+static bool is_private_address(uint32_t ip) {
+    BYTE octet0 = (ip >> 0) & 0xFF;
+    BYTE octet1 = (ip >> 8) & 0xFF;
+
+    // 10.0.0.0/8
+    if (octet0 == 10)
+        return true;
+
+    // 172.16.0.0/12
+    if (octet0 == 172 && (octet1 >= 16 && octet1 <= 31))
+        return true;
+
+    // 192.168.0.0/16
+    if (octet0 == 192 && octet1 == 168)
+        return true;
+
+    return false;
+}
+
 DWORD PacketProcessor_GetProcessFromTcp(uint32_t src_ip, uint16_t src_port) {
     MIB_TCPTABLE_OWNER_PID* tcp_table = NULL;
     DWORD size = 0;
     DWORD pid = 0;
 
-    // Retry mechanism for newly started processes
-    // TCP table may not be immediately updated when a new process starts
-    for (int retry = 0; retry < 3 && pid == 0; retry++) {
-        if (retry > 0) {
-            Sleep(1);  // Brief delay before retry
-        }
-
-        size = 0;
-        if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET,
-                                TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER) {
-            continue;
-        }
-
+    // Single attempt - connection cache handles stale table lookups on retry
+    size = 0;
+    if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET,
+                            TCP_TABLE_OWNER_PID_ALL, 0) == ERROR_INSUFFICIENT_BUFFER) {
         tcp_table = (MIB_TCPTABLE_OWNER_PID*)malloc(size);
-        if (tcp_table == NULL) {
-            continue;
-        }
-
-        if (GetExtendedTcpTable(tcp_table, &size, FALSE, AF_INET,
-                                TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
-            free(tcp_table);
-            tcp_table = NULL;
-            continue;
-        }
-
-        for (DWORD i = 0; i < tcp_table->dwNumEntries; i++) {
-            MIB_TCPROW_OWNER_PID* row = &tcp_table->table[i];
-            if (row->dwLocalAddr == src_ip &&
-                ntohs((UINT16)row->dwLocalPort) == src_port) {
-                pid = row->dwOwningPid;
-                break;
+        if (tcp_table != NULL) {
+            if (GetExtendedTcpTable(tcp_table, &size, FALSE, AF_INET,
+                                    TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+                for (DWORD i = 0; i < tcp_table->dwNumEntries; i++) {
+                    if (tcp_table->table[i].dwLocalAddr == src_ip &&
+                        ntohs((UINT16)tcp_table->table[i].dwLocalPort) == src_port) {
+                        pid = tcp_table->table[i].dwOwningPid;
+                        break;
+                    }
+                }
             }
+            free(tcp_table);
         }
-
-        free(tcp_table);
-        tcp_table = NULL;
     }
 
     return pid;
@@ -396,54 +394,34 @@ DWORD PacketProcessor_GetProcessFromUdp(uint32_t src_ip, uint16_t src_port) {
     DWORD size = 0;
     DWORD pid = 0;
 
-    // Retry mechanism for newly started processes
-    for (int retry = 0; retry < 3 && pid == 0; retry++) {
-        if (retry > 0) {
-            Sleep(1);  // Brief delay before retry
-        }
-
-        size = 0;
-        if (GetExtendedUdpTable(NULL, &size, FALSE, AF_INET,
-                                UDP_TABLE_OWNER_PID, 0) != ERROR_INSUFFICIENT_BUFFER) {
-            continue;
-        }
-
+    // Single attempt - connection cache handles stale table lookups on retry
+    size = 0;
+    if (GetExtendedUdpTable(NULL, &size, FALSE, AF_INET,
+                            UDP_TABLE_OWNER_PID, 0) == ERROR_INSUFFICIENT_BUFFER) {
         udp_table = (MIB_UDPTABLE_OWNER_PID*)malloc(size);
-        if (udp_table == NULL) {
-            continue;
-        }
-
-        if (GetExtendedUdpTable(udp_table, &size, FALSE, AF_INET,
-                                UDP_TABLE_OWNER_PID, 0) != NO_ERROR) {
-            free(udp_table);
-            udp_table = NULL;
-            continue;
-        }
-
-        // First pass: exact match
-        for (DWORD i = 0; i < udp_table->dwNumEntries; i++) {
-            MIB_UDPROW_OWNER_PID* row = &udp_table->table[i];
-            if (row->dwLocalAddr == src_ip &&
-                ntohs((UINT16)row->dwLocalPort) == src_port) {
-                pid = row->dwOwningPid;
-                break;
-            }
-        }
-
-        // Second pass: match on 0.0.0.0
-        if (pid == 0) {
-            for (DWORD i = 0; i < udp_table->dwNumEntries; i++) {
-                MIB_UDPROW_OWNER_PID* row = &udp_table->table[i];
-                if (row->dwLocalAddr == 0 &&
-                    ntohs((UINT16)row->dwLocalPort) == src_port) {
-                    pid = row->dwOwningPid;
-                    break;
+        if (udp_table != NULL) {
+            if (GetExtendedUdpTable(udp_table, &size, FALSE, AF_INET,
+                                    UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+                for (DWORD i = 0; i < udp_table->dwNumEntries; i++) {
+                    if (udp_table->table[i].dwLocalAddr == src_ip &&
+                        ntohs((UINT16)udp_table->table[i].dwLocalPort) == src_port) {
+                        pid = udp_table->table[i].dwOwningPid;
+                        break;
+                    }
+                }
+                // Match on 0.0.0.0 if exact match failed
+                if (pid == 0) {
+                    for (DWORD i = 0; i < udp_table->dwNumEntries; i++) {
+                        if (udp_table->table[i].dwLocalAddr == 0 &&
+                            ntohs((UINT16)udp_table->table[i].dwLocalPort) == src_port) {
+                            pid = udp_table->table[i].dwOwningPid;
+                            break;
+                        }
+                    }
                 }
             }
+            free(udp_table);
         }
-
-        free(udp_table);
-        udp_table = NULL;
     }
 
     return pid;
@@ -566,6 +544,12 @@ static DWORD WINAPI PacketProcessorThread(LPVOID arg) {
                 continue;
             }
 
+            // LAN BYPASS: Private addresses go direct (no proxy)
+            if (is_private_address(dest_ip)) {
+                WinDivertSend(g_windivert_handle, packet, packet_len, NULL, &addr);
+                continue;
+            }
+
             uint8_t protocol = is_tcp ? 6 : 17;
 
             // FAST PATH: Check decision cache to skip expensive processing
@@ -602,17 +586,27 @@ static DWORD WINAPI PacketProcessorThread(LPVOID arg) {
                 }
             }
 
-            // Determine action
+            // Determine action with per-rule proxy
             RuleAction action = RULE_ACTION_DIRECT;
+            ProxyInfo matched_proxy;
+            memset(&matched_proxy, 0, sizeof(matched_proxy));
+
             if (dest_port == 53 && !g_dns_via_proxy) {
                 action = RULE_ACTION_DIRECT;
             } else {
-                action = RuleEngine_Match(process_name, dest_ip, dest_port, is_tcp);
+                action = RuleEngine_Match(process_name, dest_ip, dest_port, is_tcp, &matched_proxy);
             }
 
-            // No proxy configured
-            if (action == RULE_ACTION_PROXY && (g_proxy_host[0] == '\0' || g_proxy_port == 0)) {
-                action = RULE_ACTION_DIRECT;
+            // Resolve effective proxy: per-rule proxy or fall back to global
+            if (action == RULE_ACTION_PROXY) {
+                if (!matched_proxy.has_proxy) {
+                    // No per-rule proxy, try global
+                    ProxyEngine_GetGlobalProxy(&matched_proxy);
+                }
+                if (!matched_proxy.has_proxy) {
+                    // No proxy available at all
+                    action = RULE_ACTION_DIRECT;
+                }
             }
 
             // Cache the decision
@@ -637,7 +631,7 @@ static DWORD WINAPI PacketProcessorThread(LPVOID arg) {
             }
 
             if (action == RULE_ACTION_PROXY && is_tcp) {
-                ConnectionTracker_Add(src_port, src_ip, dest_ip, dest_port);
+                ConnectionTracker_Add(src_port, src_ip, dest_ip, dest_port, &matched_proxy);
                 ip_header->DstAddr = src_ip;
                 tcp_header->DstPort = htons(g_active_tcp_port);
                 WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
@@ -646,7 +640,7 @@ static DWORD WINAPI PacketProcessorThread(LPVOID arg) {
             }
 
             if (action == RULE_ACTION_PROXY && is_udp) {
-                uint16_t relay_port = UdpRelay_AddSession(src_ip, src_port, dest_ip, dest_port);
+                uint16_t relay_port = UdpRelay_AddSession(src_ip, src_port, dest_ip, dest_port, &matched_proxy);
                 if (relay_port != 0) {
                     uint32_t temp = ip_header->DstAddr;
                     udp_header->DstPort = htons(relay_port);

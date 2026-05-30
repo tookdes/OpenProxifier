@@ -17,6 +17,7 @@ struct ProxyRule {
     QString ports;
     RuleProtocol protocol;
     RuleAction action;
+    ProxyInfo proxy;       // per-rule proxy (has_proxy=false means use global)
     bool enabled;
 };
 
@@ -38,7 +39,9 @@ public:
 
     // Rule management
     uint32_t addRule(const QString& process, const QString& hosts,
-                     const QString& ports, RuleProtocol proto, RuleAction action);
+                     const QString& ports, RuleProtocol proto, RuleAction action,
+                     const ProxyInfo* proxy = nullptr);
+    bool getGlobalProxy(ProxyInfo* out);
     bool removeRule(uint32_t ruleId);
     bool enableRule(uint32_t ruleId, bool enable);
     void clearRules();

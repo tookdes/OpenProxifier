@@ -20,6 +20,7 @@ typedef struct ProxyRule {
     char target_ports[MAX_TARGET_PORTS];
     RuleProtocol protocol;
     RuleAction action;
+    ProxyInfo proxy;       // per-rule proxy (has_proxy=false means use global)
     bool enabled;
     struct ProxyRule* next;
 } ProxyRule;
@@ -29,15 +30,17 @@ void RuleEngine_Init(void);
 void RuleEngine_Cleanup(void);
 
 uint32_t RuleEngine_AddRule(const char* process, const char* hosts,
-                            const char* ports, RuleProtocol proto, RuleAction action);
+                            const char* ports, RuleProtocol proto, RuleAction action,
+                            const ProxyInfo* proxy);
 bool RuleEngine_RemoveRule(uint32_t rule_id);
 bool RuleEngine_EnableRule(uint32_t rule_id, bool enable);
 void RuleEngine_ClearRules(void);
 
 // Match a connection against rules
 // Returns the action to take (PROXY/DIRECT/BLOCK)
+// If out_proxy is non-NULL, copies the matched rule's proxy info into it
 RuleAction RuleEngine_Match(const char* process_name, uint32_t dest_ip,
-                            uint16_t dest_port, bool is_tcp);
+                            uint16_t dest_port, bool is_tcp, ProxyInfo* out_proxy);
 
 // Pattern matching helpers
 bool RuleEngine_MatchProcessPattern(const char* pattern, const char* process_name);

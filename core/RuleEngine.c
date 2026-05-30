@@ -24,7 +24,8 @@ void RuleEngine_Cleanup(void) {
 }
 
 uint32_t RuleEngine_AddRule(const char* process, const char* hosts,
-                            const char* ports, RuleProtocol proto, RuleAction action) {
+                            const char* ports, RuleProtocol proto, RuleAction action,
+                            const ProxyInfo* proxy) {
     if (!g_initialized || process == NULL || process[0] == '\0')
         return 0;
 
@@ -53,6 +54,11 @@ uint32_t RuleEngine_AddRule(const char* process, const char* hosts,
 
     rule->protocol = proto;
     rule->action = action;
+    if (proxy != NULL) {
+        rule->proxy = *proxy;
+    } else {
+        memset(&rule->proxy, 0, sizeof(ProxyInfo));
+    }
     rule->enabled = true;
     rule->next = g_rules_list;
     g_rules_list = rule;
@@ -321,8 +327,11 @@ static bool match_port_list(const char* port_list, uint16_t port) {
 }
 
 RuleAction RuleEngine_Match(const char* process_name, uint32_t dest_ip,
-                            uint16_t dest_port, bool is_tcp) {
-    if (!g_initialized) return RULE_ACTION_DIRECT;
+                            uint16_t dest_port, bool is_tcp, ProxyInfo* out_proxy) {
+    if (!g_initialized) {
+        if (out_proxy) memset(out_proxy, 0, sizeof(ProxyInfo));
+        return RULE_ACTION_DIRECT;
+    }
 
     EnterCriticalSection(&g_lock);
 
@@ -358,6 +367,7 @@ RuleAction RuleEngine_Match(const char* process_name, uint32_t dest_ip,
                 if (match_ip_list(rule->target_hosts, dest_ip) &&
                     match_port_list(rule->target_ports, dest_port)) {
                     RuleAction action = rule->action;
+                    if (out_proxy) *out_proxy = rule->proxy;
                     LeaveCriticalSection(&g_lock);
                     return action;
                 }
@@ -378,6 +388,7 @@ RuleAction RuleEngine_Match(const char* process_name, uint32_t dest_ip,
             if (match_ip_list(rule->target_hosts, dest_ip) &&
                 match_port_list(rule->target_ports, dest_port)) {
                 RuleAction action = rule->action;
+                if (out_proxy) *out_proxy = rule->proxy;
                 LeaveCriticalSection(&g_lock);
                 return action;
             }
@@ -389,10 +400,12 @@ RuleAction RuleEngine_Match(const char* process_name, uint32_t dest_ip,
     // No specific rule matched, use wildcard if available
     if (wildcard_rule != NULL) {
         RuleAction action = wildcard_rule->action;
+        if (out_proxy) *out_proxy = wildcard_rule->proxy;
         LeaveCriticalSection(&g_lock);
         return action;
     }
 
     LeaveCriticalSection(&g_lock);
+    if (out_proxy) memset(out_proxy, 0, sizeof(ProxyInfo));
     return RULE_ACTION_DIRECT;
 }

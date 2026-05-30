@@ -1,6 +1,7 @@
 #ifndef UDP_RELAY_H
 #define UDP_RELAY_H
 
+#include "ProxyEngine.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <winsock2.h>
@@ -24,11 +25,13 @@ void UdpRelay_Stop(void);
 // Add a UDP session for proxying
 // Returns the local relay port to redirect packets to
 uint16_t UdpRelay_AddSession(uint32_t client_ip, uint16_t client_port,
-                              uint32_t dest_ip, uint16_t dest_port);
+                              uint32_t dest_ip, uint16_t dest_port,
+                              const ProxyInfo* proxy);
 
 // Add IPv6 UDP session
 uint16_t UdpRelay_AddSessionIPv6(uint32_t client_ip, uint16_t client_port,
-                                  const uint8_t* dest_ipv6, uint16_t dest_port);
+                                  const uint8_t* dest_ipv6, uint16_t dest_port,
+                                  const ProxyInfo* proxy);
 
 #ifdef __cplusplus
 }

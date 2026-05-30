@@ -10,13 +10,10 @@
 #pragma comment(lib, "ws2_32.lib")
 
 #define MAX_UDP_SESSIONS 256
+#define UDP_SESSION_TIMEOUT 120000  // 120 seconds idle timeout
 #define UDP_BUFFER_SIZE 65535
 
 // External references
-extern char g_proxy_host[256];
-extern uint16_t g_proxy_port;
-extern char g_proxy_username[64];
-extern char g_proxy_password[64];
 extern LogCallback g_log_callback;
 
 typedef struct {
@@ -32,6 +29,7 @@ typedef struct {
     uint32_t relay_ip;          // Proxy's UDP relay IP
     uint16_t relay_port;        // Proxy's UDP relay port
     uint16_t local_port;        // Local port for client
+    ProxyInfo proxy;            // Per-session proxy
     DWORD last_activity;
 } UdpSession;
 
@@ -85,7 +83,8 @@ static int build_udp_header_ipv6(uint8_t* buf, const uint8_t* dest_ipv6, uint16_
 }
 
 static int Socks5_UdpAssociate(SOCKET s, uint32_t* relay_ip, uint16_t* relay_port,
-                                const char* username, const char* password) {
+                                const char* username, const char* password,
+                                const char* proxy_host) {
     unsigned char buf[512];
     int len;
     bool use_auth = (username != NULL && username[0] != '\0');
@@ -162,8 +161,8 @@ static int Socks5_UdpAssociate(SOCKET s, uint32_t* relay_ip, uint16_t* relay_por
     }
 
     // If relay IP is 0.0.0.0, use proxy server IP
-    if (*relay_ip == 0) {
-        *relay_ip = Socks5_ResolveHostname(g_proxy_host);
+    if (*relay_ip == 0 && proxy_host != NULL) {
+        *relay_ip = Socks5_ResolveHostname(proxy_host);
     }
 
     return 0;
@@ -197,85 +196,104 @@ static DWORD WINAPI UdpRelayThread(LPVOID arg) {
     log_message("[UdpRelay] Thread started on port %d", g_local_port);
 
     while (g_running) {
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        FD_SET(g_listen_socket, &read_fds);
-
-        // Also add all session relay sockets
+        // Expire idle sessions
+        DWORD now = GetTickCount();
         EnterCriticalSection(&g_lock);
         for (int i = 0; i < MAX_UDP_SESSIONS; i++) {
-            if (g_sessions[i].active && g_sessions[i].relay_udp_socket != INVALID_SOCKET) {
-                FD_SET(g_sessions[i].relay_udp_socket, &read_fds);
+            if (g_sessions[i].active && (now - g_sessions[i].last_activity) > UDP_SESSION_TIMEOUT) {
+                log_message("[UdpRelay] Session expired: client port %d", g_sessions[i].client_port);
+                if (g_sessions[i].proxy_tcp_socket != INVALID_SOCKET)
+                    closesocket(g_sessions[i].proxy_tcp_socket);
+                if (g_sessions[i].relay_udp_socket != INVALID_SOCKET)
+                    closesocket(g_sessions[i].relay_udp_socket);
+                g_sessions[i].active = false;
             }
         }
         LeaveCriticalSection(&g_lock);
 
-        struct timeval timeout = {1, 0};
-        int ret = select(0, &read_fds, NULL, NULL, &timeout);
-        if (ret <= 0) continue;
+        // Use WSA events to wait for socket readiness (avoids FD_SETSIZE=64 limit)
+        WSAEVENT events[MAX_UDP_SESSIONS + 1];
+        int event_count = 0;
 
-        // Check main listen socket (incoming from clients)
-        if (FD_ISSET(g_listen_socket, &read_fds)) {
-            from_len = sizeof(from_addr);
-            int recv_len = recvfrom(g_listen_socket, (char*)buffer, sizeof(buffer), 0,
-                                    (struct sockaddr*)&from_addr, &from_len);
-            if (recv_len > 0) {
-                uint32_t client_ip = from_addr.sin_addr.s_addr;
-                uint16_t client_port = ntohs(from_addr.sin_port);
+        WSAEVENT listen_event = WSACreateEvent();
+        WSAEventSelect(g_listen_socket, listen_event, FD_READ);
+        events[event_count++] = listen_event;
 
-                EnterCriticalSection(&g_lock);
-                UdpSession* session = find_session_by_client(client_ip, client_port);
-                if (session != NULL && session->relay_udp_socket != INVALID_SOCKET) {
-                    // Build SOCKS5 UDP header and forward
-                    uint8_t send_buf[UDP_BUFFER_SIZE];
-                    int header_len;
-                    if (session->is_ipv6) {
-                        header_len = build_udp_header_ipv6(send_buf, session->dest_ipv6, session->dest_port);
-                    } else {
-                        header_len = build_udp_header(send_buf, session->dest_ip, session->dest_port);
-                    }
-                    memcpy(send_buf + header_len, buffer, recv_len);
-
-                    struct sockaddr_in relay_addr = {0};
-                    relay_addr.sin_family = AF_INET;
-                    relay_addr.sin_addr.s_addr = session->relay_ip;
-                    relay_addr.sin_port = htons(session->relay_port);
-
-                    sendto(session->relay_udp_socket, (char*)send_buf, header_len + recv_len, 0,
-                           (struct sockaddr*)&relay_addr, sizeof(relay_addr));
-                    session->last_activity = GetTickCount();
-                }
-                LeaveCriticalSection(&g_lock);
-            }
-        }
-
-        // Check session relay sockets (incoming from proxy)
         EnterCriticalSection(&g_lock);
         for (int i = 0; i < MAX_UDP_SESSIONS; i++) {
-            if (g_sessions[i].active &&
-                g_sessions[i].relay_udp_socket != INVALID_SOCKET &&
-                FD_ISSET(g_sessions[i].relay_udp_socket, &read_fds)) {
+            if (g_sessions[i].active && g_sessions[i].relay_udp_socket != INVALID_SOCKET) {
+                WSAEVENT ev = WSACreateEvent();
+                WSAEventSelect(g_sessions[i].relay_udp_socket, ev, FD_READ);
+                events[event_count++] = ev;
+            }
+        }
+        LeaveCriticalSection(&g_lock);
 
-                from_len = sizeof(from_addr);
-                int recv_len = recvfrom(g_sessions[i].relay_udp_socket, (char*)buffer, sizeof(buffer), 0,
-                                        (struct sockaddr*)&from_addr, &from_len);
-                if (recv_len > 10) {
-                    // Skip SOCKS5 UDP header (minimum 10 bytes for IPv4)
-                    int header_len = 10;
-                    if (buffer[3] == 0x04) header_len = 22;  // IPv6
-                    else if (buffer[3] == 0x03) header_len = 4 + 1 + buffer[4] + 2;  // Domain
+        DWORD wait_result = WaitForMultipleObjects(event_count, events, FALSE, 1000);
 
-                    if (recv_len > header_len) {
-                        // Send back to client
-                        struct sockaddr_in client_addr = {0};
-                        client_addr.sin_family = AF_INET;
-                        client_addr.sin_addr.s_addr = g_sessions[i].client_ip;
-                        client_addr.sin_port = htons(g_sessions[i].client_port);
+        // Close all events immediately (sockets are now non-blocking from WSAEventSelect)
+        for (int i = 0; i < event_count; i++) {
+            WSACloseEvent(events[i]);
+        }
 
-                        sendto(g_listen_socket, (char*)(buffer + header_len), recv_len - header_len, 0,
-                               (struct sockaddr*)&client_addr, sizeof(client_addr));
-                        g_sessions[i].last_activity = GetTickCount();
-                    }
+        if (wait_result == WAIT_TIMEOUT || wait_result == WAIT_FAILED)
+            continue;
+
+        // Check main listen socket (non-blocking after WSAEventSelect)
+        from_len = sizeof(from_addr);
+        int recv_len = recvfrom(g_listen_socket, (char*)buffer, sizeof(buffer), 0,
+                                (struct sockaddr*)&from_addr, &from_len);
+        if (recv_len > 0) {
+            uint32_t client_ip = from_addr.sin_addr.s_addr;
+            uint16_t client_port = ntohs(from_addr.sin_port);
+
+            EnterCriticalSection(&g_lock);
+            UdpSession* session = find_session_by_client(client_ip, client_port);
+            if (session != NULL && session->relay_udp_socket != INVALID_SOCKET) {
+                uint8_t send_buf[UDP_BUFFER_SIZE];
+                int header_len;
+                if (session->is_ipv6) {
+                    header_len = build_udp_header_ipv6(send_buf, session->dest_ipv6, session->dest_port);
+                } else {
+                    header_len = build_udp_header(send_buf, session->dest_ip, session->dest_port);
+                }
+                memcpy(send_buf + header_len, buffer, recv_len);
+
+                struct sockaddr_in relay_addr = {0};
+                relay_addr.sin_family = AF_INET;
+                relay_addr.sin_addr.s_addr = session->relay_ip;
+                relay_addr.sin_port = htons(session->relay_port);
+
+                sendto(session->relay_udp_socket, (char*)send_buf, header_len + recv_len, 0,
+                       (struct sockaddr*)&relay_addr, sizeof(relay_addr));
+                session->last_activity = GetTickCount();
+            }
+            LeaveCriticalSection(&g_lock);
+        }
+
+        // Check session relay sockets (non-blocking after WSAEventSelect)
+        EnterCriticalSection(&g_lock);
+        for (int i = 0; i < MAX_UDP_SESSIONS; i++) {
+            if (!g_sessions[i].active || g_sessions[i].relay_udp_socket == INVALID_SOCKET)
+                continue;
+
+            from_len = sizeof(from_addr);
+            recv_len = recvfrom(g_sessions[i].relay_udp_socket, (char*)buffer, sizeof(buffer), 0,
+                                    (struct sockaddr*)&from_addr, &from_len);
+            if (recv_len > 10) {
+                int header_len = 10;
+                if (buffer[3] == 0x04) header_len = 22;
+                else if (buffer[3] == 0x03) header_len = 4 + 1 + buffer[4] + 2;
+
+                if (recv_len > header_len) {
+                    struct sockaddr_in client_addr = {0};
+                    client_addr.sin_family = AF_INET;
+                    client_addr.sin_addr.s_addr = g_sessions[i].client_ip;
+                    client_addr.sin_port = htons(g_sessions[i].client_port);
+
+                    sendto(g_listen_socket, (char*)(buffer + header_len), recv_len - header_len, 0,
+                           (struct sockaddr*)&client_addr, sizeof(client_addr));
+                    g_sessions[i].last_activity = GetTickCount();
                 }
             }
         }
@@ -366,7 +384,17 @@ void UdpRelay_Stop(void) {
 }
 
 uint16_t UdpRelay_AddSession(uint32_t client_ip, uint16_t client_port,
-                              uint32_t dest_ip, uint16_t dest_port) {
+                              uint32_t dest_ip, uint16_t dest_port,
+                              const ProxyInfo* proxy) {
+    // Resolve effective proxy
+    ProxyInfo effective;
+    if (proxy && proxy->has_proxy) {
+        effective = *proxy;
+    } else {
+        ProxyEngine_GetGlobalProxy(&effective);
+    }
+    if (!effective.has_proxy) return 0;
+
     EnterCriticalSection(&g_lock);
 
     // Check if session already exists
@@ -384,7 +412,7 @@ uint16_t UdpRelay_AddSession(uint32_t client_ip, uint16_t client_port,
     }
 
     // Connect to proxy for UDP ASSOCIATE
-    uint32_t proxy_ip = Socks5_ResolveHostname(g_proxy_host);
+    uint32_t proxy_ip = Socks5_ResolveHostname(effective.host);
     if (proxy_ip == 0) {
         LeaveCriticalSection(&g_lock);
         log_message("[UdpRelay] Failed to resolve proxy");
@@ -400,7 +428,7 @@ uint16_t UdpRelay_AddSession(uint32_t client_ip, uint16_t client_port,
     struct sockaddr_in proxy_addr = {0};
     proxy_addr.sin_family = AF_INET;
     proxy_addr.sin_addr.s_addr = proxy_ip;
-    proxy_addr.sin_port = htons(g_proxy_port);
+    proxy_addr.sin_port = htons(effective.port);
 
     if (connect(tcp_sock, (struct sockaddr*)&proxy_addr, sizeof(proxy_addr)) == SOCKET_ERROR) {
         closesocket(tcp_sock);
@@ -411,7 +439,8 @@ uint16_t UdpRelay_AddSession(uint32_t client_ip, uint16_t client_port,
 
     uint32_t relay_ip = 0;
     uint16_t relay_port = 0;
-    if (Socks5_UdpAssociate(tcp_sock, &relay_ip, &relay_port, g_proxy_username, g_proxy_password) != 0) {
+    if (Socks5_UdpAssociate(tcp_sock, &relay_ip, &relay_port,
+                             effective.username, effective.password, effective.host) != 0) {
         closesocket(tcp_sock);
         LeaveCriticalSection(&g_lock);
         return 0;
@@ -436,6 +465,7 @@ uint16_t UdpRelay_AddSession(uint32_t client_ip, uint16_t client_port,
     session->relay_ip = relay_ip;
     session->relay_port = relay_port;
     session->local_port = g_local_port;
+    session->proxy = effective;
     session->last_activity = GetTickCount();
 
     log_message("[UdpRelay] New session: client %d -> relay %d.%d.%d.%d:%d",
@@ -448,7 +478,17 @@ uint16_t UdpRelay_AddSession(uint32_t client_ip, uint16_t client_port,
 }
 
 uint16_t UdpRelay_AddSessionIPv6(uint32_t client_ip, uint16_t client_port,
-                                  const uint8_t* dest_ipv6, uint16_t dest_port) {
+                                  const uint8_t* dest_ipv6, uint16_t dest_port,
+                                  const ProxyInfo* proxy) {
+    // Resolve effective proxy
+    ProxyInfo effective;
+    if (proxy && proxy->has_proxy) {
+        effective = *proxy;
+    } else {
+        ProxyEngine_GetGlobalProxy(&effective);
+    }
+    if (!effective.has_proxy) return 0;
+
     EnterCriticalSection(&g_lock);
 
     UdpSession* session = find_session_by_client(client_ip, client_port);
@@ -463,7 +503,7 @@ uint16_t UdpRelay_AddSessionIPv6(uint32_t client_ip, uint16_t client_port,
         return 0;
     }
 
-    uint32_t proxy_ip = Socks5_ResolveHostname(g_proxy_host);
+    uint32_t proxy_ip = Socks5_ResolveHostname(effective.host);
     if (proxy_ip == 0) {
         LeaveCriticalSection(&g_lock);
         return 0;
@@ -478,7 +518,7 @@ uint16_t UdpRelay_AddSessionIPv6(uint32_t client_ip, uint16_t client_port,
     struct sockaddr_in proxy_addr = {0};
     proxy_addr.sin_family = AF_INET;
     proxy_addr.sin_addr.s_addr = proxy_ip;
-    proxy_addr.sin_port = htons(g_proxy_port);
+    proxy_addr.sin_port = htons(effective.port);
 
     if (connect(tcp_sock, (struct sockaddr*)&proxy_addr, sizeof(proxy_addr)) == SOCKET_ERROR) {
         closesocket(tcp_sock);
@@ -488,7 +528,8 @@ uint16_t UdpRelay_AddSessionIPv6(uint32_t client_ip, uint16_t client_port,
 
     uint32_t relay_ip = 0;
     uint16_t relay_port = 0;
-    if (Socks5_UdpAssociate(tcp_sock, &relay_ip, &relay_port, g_proxy_username, g_proxy_password) != 0) {
+    if (Socks5_UdpAssociate(tcp_sock, &relay_ip, &relay_port,
+                             effective.username, effective.password, effective.host) != 0) {
         closesocket(tcp_sock);
         LeaveCriticalSection(&g_lock);
         return 0;
@@ -513,6 +554,7 @@ uint16_t UdpRelay_AddSessionIPv6(uint32_t client_ip, uint16_t client_port,
     session->relay_ip = relay_ip;
     session->relay_port = relay_port;
     session->local_port = g_local_port;
+    session->proxy = effective;
     session->last_activity = GetTickCount();
 
     LeaveCriticalSection(&g_lock);

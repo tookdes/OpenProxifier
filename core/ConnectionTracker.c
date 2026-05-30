@@ -21,7 +21,8 @@ void ConnectionTracker_Cleanup(void) {
 }
 
 void ConnectionTracker_Add(uint16_t src_port, uint32_t src_ip,
-                           uint32_t dest_ip, uint16_t dest_port) {
+                           uint32_t dest_ip, uint16_t dest_port,
+                           const ProxyInfo* proxy) {
     if (!g_initialized) return;
 
     EnterCriticalSection(&g_lock);
@@ -34,6 +35,8 @@ void ConnectionTracker_Add(uint16_t src_port, uint32_t src_ip,
             conn->orig_dest_port = dest_port;
             conn->is_ipv6 = false;
             conn->is_tracked = true;
+            if (proxy) conn->proxy = *proxy;
+            else memset(&conn->proxy, 0, sizeof(ProxyInfo));
             LeaveCriticalSection(&g_lock);
             return;
         }
@@ -53,6 +56,8 @@ void ConnectionTracker_Add(uint16_t src_port, uint32_t src_ip,
     conn->orig_dest_port = dest_port;
     conn->is_ipv6 = false;
     conn->is_tracked = true;
+    if (proxy) conn->proxy = *proxy;
+    else memset(&conn->proxy, 0, sizeof(ProxyInfo));
     conn->next = g_connection_list;
     g_connection_list = conn;
 
@@ -60,7 +65,8 @@ void ConnectionTracker_Add(uint16_t src_port, uint32_t src_ip,
 }
 
 void ConnectionTracker_AddIPv6(uint16_t src_port, uint32_t src_ip,
-                               const uint8_t* dest_ipv6, uint16_t dest_port) {
+                               const uint8_t* dest_ipv6, uint16_t dest_port,
+                               const ProxyInfo* proxy) {
     if (!g_initialized) return;
 
     EnterCriticalSection(&g_lock);
@@ -74,6 +80,8 @@ void ConnectionTracker_AddIPv6(uint16_t src_port, uint32_t src_ip,
             conn->orig_dest_port = dest_port;
             conn->is_ipv6 = true;
             conn->is_tracked = true;
+            if (proxy) conn->proxy = *proxy;
+            else memset(&conn->proxy, 0, sizeof(ProxyInfo));
             LeaveCriticalSection(&g_lock);
             return;
         }
@@ -93,6 +101,8 @@ void ConnectionTracker_AddIPv6(uint16_t src_port, uint32_t src_ip,
     conn->orig_dest_port = dest_port;
     conn->is_ipv6 = true;
     conn->is_tracked = true;
+    if (proxy) conn->proxy = *proxy;
+    else memset(&conn->proxy, 0, sizeof(ProxyInfo));
     conn->next = g_connection_list;
     g_connection_list = conn;
 
@@ -161,6 +171,26 @@ bool ConnectionTracker_GetEx(uint16_t src_port, uint32_t* dest_ip,
                 *dest_ip = conn->orig_dest_ip;
             }
             *dest_port = conn->orig_dest_port;
+            found = true;
+            break;
+        }
+        conn = conn->next;
+    }
+
+    LeaveCriticalSection(&g_lock);
+    return found;
+}
+
+bool ConnectionTracker_GetProxy(uint16_t src_port, ProxyInfo* proxy) {
+    if (!g_initialized || proxy == NULL) return false;
+
+    bool found = false;
+    EnterCriticalSection(&g_lock);
+
+    ConnectionInfo* conn = g_connection_list;
+    while (conn != NULL) {
+        if (conn->src_port == src_port) {
+            *proxy = conn->proxy;
             found = true;
             break;
         }

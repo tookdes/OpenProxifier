@@ -13,6 +13,8 @@
 #include <QTimer>
 #include <QProcess>
 #include <QApplication>
+#include <QHeaderView>
+#include <QComboBox>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -116,9 +118,22 @@ MainWindow::MainWindow(QWidget *parent)
     // Load settings (includes server history and target list)
     loadSettings();
 
-    // Auto-add ProxyTestApp.exe as default target if list is empty
-    if (ui->exeListWidget->count() == 0) {
-        ui->exeListWidget->addItem("ProxyTestApp.exe");
+    // Setup rule table columns
+    ui->ruleTableWidget->setColumnCount(3);
+    ui->ruleTableWidget->setHorizontalHeaderLabels({tr_log("Process", QStringLiteral("进程")),
+                                                     tr_log("Action", QStringLiteral("操作")),
+                                                     tr_log("Proxy", QStringLiteral("代理"))});
+    ui->ruleTableWidget->horizontalHeader()->setStretchLastSection(true);
+    ui->ruleTableWidget->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    ui->ruleTableWidget->setColumnWidth(1, 80);
+    ui->ruleTableWidget->setColumnWidth(2, 180);
+
+    // Connect set proxy button
+    connect(ui->setRuleProxyButton, &QPushButton::clicked, this, &MainWindow::onSetRuleProxyClicked);
+
+    // Auto-add ProxyTestApp.exe as default target if table is empty
+    if (ui->ruleTableWidget->rowCount() == 0) {
+        addRuleRow("ProxyTestApp.exe", RULE_ACTION_PROXY, "");
         appendLog(tr_log("Added default target: ProxyTestApp.exe",
                          QStringLiteral("已添加默认目标: ProxyTestApp.exe")));
     }
@@ -182,10 +197,33 @@ void MainWindow::loadSettings()
     // Load server history
     loadServerHistory();
 
-    // Load target processes
-    QStringList targets = m_settings->value("targetProcesses").toStringList();
-    for (const QString& target : targets) {
-        ui->exeListWidget->addItem(target);
+    // Load target processes with per-rule action and proxy
+    m_settings->beginGroup("rules");
+    QStringList ruleKeys = m_settings->childGroups();
+    if (ruleKeys.isEmpty()) {
+        // Legacy format: simple string list
+        m_settings->endGroup();
+        QStringList targets = m_settings->value("targetProcesses").toStringList();
+        for (const QString& target : targets) {
+            addRuleRow(target, RULE_ACTION_PROXY, "");
+        }
+    } else {
+        for (const QString& key : ruleKeys) {
+            m_settings->beginGroup(key);
+            QString process = m_settings->value("process").toString();
+            QString actionStr = m_settings->value("action", "PROXY").toString();
+            QString proxyStr = m_settings->value("proxy", "").toString();
+            m_settings->endGroup();
+
+            if (process.isEmpty()) continue;
+
+            RuleAction action = RULE_ACTION_PROXY;
+            if (actionStr == "DIRECT") action = RULE_ACTION_DIRECT;
+            else if (actionStr == "BLOCK") action = RULE_ACTION_BLOCK;
+
+            addRuleRow(process, action, proxyStr);
+        }
+        m_settings->endGroup();
     }
 
     // Load last used proxy settings
@@ -213,10 +251,35 @@ void MainWindow::saveSettings()
     // Save server history
     saveServerHistory();
 
-    // Save target processes
+    // Save target processes with per-rule action and proxy
+    m_settings->remove("rules");  // Clear old rules
+    m_settings->beginGroup("rules");
+    for (int i = 0; i < ui->ruleTableWidget->rowCount(); ++i) {
+        QString key = QString("rule_%1").arg(i + 1);
+        m_settings->beginGroup(key);
+
+        QString process = ui->ruleTableWidget->item(i, 0)->text();
+        m_settings->setValue("process", process);
+
+        QComboBox* actionCombo = qobject_cast<QComboBox*>(ui->ruleTableWidget->cellWidget(i, 1));
+        QString actionStr = actionCombo ? actionCombo->currentText() : "PROXY";
+        m_settings->setValue("action", actionStr);
+
+        QComboBox* proxyCombo = qobject_cast<QComboBox*>(ui->ruleTableWidget->cellWidget(i, 2));
+        QString proxyStr;
+        if (proxyCombo && proxyCombo->currentIndex() > 0) {
+            proxyStr = proxyCombo->currentText();  // Custom proxy URL
+        }
+        m_settings->setValue("proxy", proxyStr);
+
+        m_settings->endGroup();
+    }
+    m_settings->endGroup();
+
+    // Also save as legacy format for backward compat
     QStringList targets;
-    for (int i = 0; i < ui->exeListWidget->count(); ++i) {
-        targets.append(ui->exeListWidget->item(i)->text());
+    for (int i = 0; i < ui->ruleTableWidget->rowCount(); ++i) {
+        targets.append(ui->ruleTableWidget->item(i, 0)->text());
     }
     m_settings->setValue("targetProcesses", targets);
 
@@ -388,8 +451,8 @@ void MainWindow::onAddExeClicked()
     }
 
     // Check for duplicates
-    for (int i = 0; i < ui->exeListWidget->count(); ++i) {
-        if (ui->exeListWidget->item(i)->text().toLower() == exeName.toLower()) {
+    for (int i = 0; i < ui->ruleTableWidget->rowCount(); ++i) {
+        if (ui->ruleTableWidget->item(i, 0)->text().toLower() == exeName.toLower()) {
             QMessageBox::warning(this,
                 tr_log("Duplicate", QStringLiteral("重复")),
                 tr_log("This executable is already in the list.",
@@ -398,12 +461,12 @@ void MainWindow::onAddExeClicked()
         }
     }
 
-    ui->exeListWidget->addItem(exeName);
+    addRuleRow(exeName, RULE_ACTION_PROXY, "");
     ui->exeNameEdit->clear();
 
     // If monitoring is active, add to monitor and inject immediately
     if (m_monitor->isMonitoring()) {
-        m_monitor->addTargetProcess(exeName, true);  // true = inject into running instances now
+        m_monitor->addTargetProcess(exeName, true);
         appendLog(tr_log(QString("Added target: %1 (scanning for running instances...)").arg(exeName),
                          QStringLiteral("已添加目标: %1 (正在扫描运行中的实例...)").arg(exeName)));
     } else {
@@ -411,18 +474,16 @@ void MainWindow::onAddExeClicked()
                          QStringLiteral("已添加目标: %1").arg(exeName)));
     }
 
-    // Save settings immediately
     saveSettings();
 }
 
 void MainWindow::onRemoveExeClicked()
 {
-    QListWidgetItem* item = ui->exeListWidget->currentItem();
-    if (item) {
-        QString exeName = item->text();
-        delete ui->exeListWidget->takeItem(ui->exeListWidget->row(item));
+    int row = ui->ruleTableWidget->currentRow();
+    if (row >= 0) {
+        QString exeName = ui->ruleTableWidget->item(row, 0)->text();
+        ui->ruleTableWidget->removeRow(row);
 
-        // If monitoring is active, remove from monitor too
         if (m_monitor->isMonitoring()) {
             m_monitor->removeTargetProcess(exeName);
         }
@@ -430,7 +491,6 @@ void MainWindow::onRemoveExeClicked()
         appendLog(tr_log(QString("Removed target: %1").arg(exeName),
                          QStringLiteral("已删除目标: %1").arg(exeName)));
 
-        // Save settings immediately
         saveSettings();
     }
 }
@@ -471,7 +531,7 @@ void MainWindow::onStartMonitorClicked()
     }
 
     // Legacy DLL injection mode
-    if (ui->exeListWidget->count() == 0) {
+    if (ui->ruleTableWidget->rowCount() == 0) {
         QMessageBox::warning(this,
             tr_log("No Targets", QStringLiteral("无目标")),
             tr_log("Please add at least one target executable to monitor.",
@@ -491,8 +551,8 @@ void MainWindow::onStartMonitorClicked()
     m_monitor->setDllPath(dllPath);
     m_monitor->clearTargetProcesses();
 
-    for (int i = 0; i < ui->exeListWidget->count(); ++i) {
-        m_monitor->addTargetProcess(ui->exeListWidget->item(i)->text());
+    for (int i = 0; i < ui->ruleTableWidget->rowCount(); ++i) {
+        m_monitor->addTargetProcess(ui->ruleTableWidget->item(i, 0)->text());
     }
 
     // Set proxy config
@@ -537,7 +597,7 @@ void MainWindow::onMonitoringStarted()
     ui->exeNameEdit->setEnabled(true);
     ui->addExeButton->setEnabled(true);
     ui->removeExeButton->setEnabled(true);
-    ui->exeListWidget->setEnabled(true);
+    ui->ruleTableWidget->setEnabled(true);
     ui->autoStartCheckBox->setEnabled(false);
     updateStatus(tr_log("Monitoring...", QStringLiteral("监控中...")));
     appendLog(tr_log("[INFO] Monitoring started - waiting for target processes...",
@@ -553,7 +613,7 @@ void MainWindow::onMonitoringStopped()
     ui->exeNameEdit->setEnabled(true);
     ui->addExeButton->setEnabled(true);
     ui->removeExeButton->setEnabled(true);
-    ui->exeListWidget->setEnabled(true);
+    ui->ruleTableWidget->setEnabled(true);
     ui->autoStartCheckBox->setEnabled(true);
     updateStatus(tr_log("Ready", QStringLiteral("就绪")));
     appendLog(tr_log("[INFO] Monitoring stopped",
@@ -1073,19 +1133,44 @@ void MainWindow::startWinDivertMode()
         return;
     }
 
-    // Clear existing rules and add new ones based on exe list
+    // Clear existing rules and add new ones based on rule table
     m_engine->clearRules();
 
-    if (ui->exeListWidget->count() == 0) {
-        // No specific targets, proxy all traffic
+    if (ui->ruleTableWidget->rowCount() == 0) {
+        // No specific targets, proxy all traffic via global proxy
         m_engine->addRule("*", "*", "*", RULE_PROTOCOL_BOTH, RULE_ACTION_PROXY);
         appendLog(tr_log("[INFO] No specific targets, proxying all traffic",
                          QStringLiteral("[信息] 未指定目标程序，代理所有流量")));
     } else {
-        // Add rules for each target process
-        for (int i = 0; i < ui->exeListWidget->count(); ++i) {
-            QString exeName = ui->exeListWidget->item(i)->text();
-            m_engine->addRule(exeName, "*", "*", RULE_PROTOCOL_BOTH, RULE_ACTION_PROXY);
+        // Add rules for each target process with per-rule action and proxy
+        for (int i = 0; i < ui->ruleTableWidget->rowCount(); ++i) {
+            QString exeName = ui->ruleTableWidget->item(i, 0)->text();
+
+            // Read action from combo
+            RuleAction action = RULE_ACTION_PROXY;
+            QComboBox* actionCombo = qobject_cast<QComboBox*>(ui->ruleTableWidget->cellWidget(i, 1));
+            if (actionCombo) {
+                QString actionStr = actionCombo->currentText();
+                if (actionStr == "DIRECT") action = RULE_ACTION_DIRECT;
+                else if (actionStr == "BLOCK") action = RULE_ACTION_BLOCK;
+            }
+
+            // Read per-rule proxy from combo
+            ProxyInfo ruleProxy;
+            memset(&ruleProxy, 0, sizeof(ruleProxy));
+            const ProxyInfo* proxyPtr = nullptr;
+
+            if (action == RULE_ACTION_PROXY) {
+                QComboBox* proxyCombo = qobject_cast<QComboBox*>(ui->ruleTableWidget->cellWidget(i, 2));
+                if (proxyCombo && proxyCombo->currentIndex() > 0) {
+                    // Custom proxy URL
+                    if (parseProxyUrl(proxyCombo->currentText(), ruleProxy)) {
+                        proxyPtr = &ruleProxy;
+                    }
+                }
+            }
+
+            m_engine->addRule(exeName, "*", "*", RULE_PROTOCOL_BOTH, action, proxyPtr);
         }
     }
 
@@ -1098,4 +1183,156 @@ void MainWindow::stopWinDivertMode()
     if (m_engine && m_engine->isRunning()) {
         m_engine->stop();
     }
+}
+
+void MainWindow::addRuleRow(const QString& process, RuleAction action, const QString& proxyUrl)
+{
+    int row = ui->ruleTableWidget->rowCount();
+    ui->ruleTableWidget->insertRow(row);
+
+    // Column 0: Process name (editable)
+    QTableWidgetItem* processItem = new QTableWidgetItem(process);
+    ui->ruleTableWidget->setItem(row, 0, processItem);
+
+    // Column 1: Action combo (PROXY / DIRECT / BLOCK)
+    QComboBox* actionCombo = new QComboBox();
+    actionCombo->addItem("PROXY");
+    actionCombo->addItem("DIRECT");
+    actionCombo->addItem("BLOCK");
+    if (action == RULE_ACTION_DIRECT) actionCombo->setCurrentText("DIRECT");
+    else if (action == RULE_ACTION_BLOCK) actionCombo->setCurrentText("BLOCK");
+    else actionCombo->setCurrentText("PROXY");
+    ui->ruleTableWidget->setCellWidget(row, 1, actionCombo);
+
+    // Column 2: Proxy combo (Global Proxy + custom URL if provided)
+    QComboBox* proxyCombo = new QComboBox();
+    proxyCombo->addItem(tr_log("Global Proxy", QStringLiteral("全局代理")));
+    if (!proxyUrl.isEmpty()) {
+        proxyCombo->addItem(proxyUrl);
+        proxyCombo->setCurrentIndex(1);
+    }
+    ui->ruleTableWidget->setCellWidget(row, 2, proxyCombo);
+
+    // Disable proxy combo when action is not PROXY
+    auto updateProxyEnabled = [actionCombo, proxyCombo]() {
+        bool isProxy = (actionCombo->currentText() == "PROXY");
+        proxyCombo->setEnabled(isProxy);
+    };
+    connect(actionCombo, &QComboBox::currentIndexChanged, this, [updateProxyEnabled, this, row](int) {
+        updateProxyEnabled();
+        saveSettings();
+    });
+    connect(proxyCombo, &QComboBox::currentIndexChanged, this, [this](int) {
+        saveSettings();
+    });
+    updateProxyEnabled();
+}
+
+void MainWindow::onSetRuleProxyClicked()
+{
+    int row = ui->ruleTableWidget->currentRow();
+    if (row < 0) {
+        QMessageBox::information(this,
+            tr_log("No Selection", QStringLiteral("未选择")),
+            tr_log("Please select a rule row first.",
+                   QStringLiteral("请先选择一行规则。")));
+        return;
+    }
+
+    QString proxyUrl = ui->ruleProxyEdit->text().trimmed();
+    if (proxyUrl.isEmpty()) {
+        QMessageBox::warning(this,
+            tr_log("No Proxy URL", QStringLiteral("无代理地址")),
+            tr_log("Please enter a proxy URL (e.g., socks5://127.0.0.1:1080).",
+                   QStringLiteral("请输入代理地址（如 socks5://127.0.0.1:1080）。")));
+        return;
+    }
+
+    // Validate the URL format
+    ProxyInfo testProxy;
+    if (!parseProxyUrl(proxyUrl, testProxy)) {
+        QMessageBox::warning(this,
+            tr_log("Invalid Proxy", QStringLiteral("无效代理")),
+            tr_log("Invalid proxy URL format. Use socks5://host:port or http://host:port.",
+                   QStringLiteral("代理地址格式无效，请使用 socks5://host:port 或 http://host:port。")));
+        return;
+    }
+
+    // Add to the proxy combo for this row
+    QComboBox* proxyCombo = qobject_cast<QComboBox*>(ui->ruleTableWidget->cellWidget(row, 2));
+    if (proxyCombo) {
+        // Check if this URL is already in the combo
+        int existingIdx = proxyCombo->findText(proxyUrl);
+        if (existingIdx >= 0) {
+            proxyCombo->setCurrentIndex(existingIdx);
+        } else {
+            proxyCombo->addItem(proxyUrl);
+            proxyCombo->setCurrentIndex(proxyCombo->count() - 1);
+        }
+    }
+
+    ui->ruleProxyEdit->clear();
+    saveSettings();
+}
+
+void MainWindow::onRuleActionChanged(int row, int index)
+{
+    if (row < 0 || row >= ui->ruleTableWidget->rowCount()) return;
+
+    QComboBox* actionCombo = qobject_cast<QComboBox*>(ui->ruleTableWidget->cellWidget(row, 1));
+    QComboBox* proxyCombo = qobject_cast<QComboBox*>(ui->ruleTableWidget->cellWidget(row, 2));
+
+    if (actionCombo && proxyCombo) {
+        bool isProxy = (actionCombo->currentText() == "PROXY");
+        proxyCombo->setEnabled(isProxy);
+    }
+
+    saveSettings();
+}
+
+bool MainWindow::parseProxyUrl(const QString& url, ProxyInfo& out)
+{
+    memset(&out, 0, sizeof(ProxyInfo));
+
+    if (url.startsWith("socks5://")) {
+        out.type = PROXY_TYPE_SOCKS5;
+    } else if (url.startsWith("http://")) {
+        out.type = PROXY_TYPE_HTTP;
+    } else {
+        return false;
+    }
+
+    // Remove protocol prefix
+    QString afterProto = url.mid(url.indexOf("://") + 3);
+
+    // Parse user:pass@host:port
+    QString hostPart = afterProto;
+    int atIndex = afterProto.indexOf('@');
+    if (atIndex >= 0) {
+        QString userInfo = afterProto.left(atIndex);
+        hostPart = afterProto.mid(atIndex + 1);
+
+        int colonIdx = userInfo.indexOf(':');
+        if (colonIdx >= 0) {
+            strncpy(out.username, userInfo.left(colonIdx).toUtf8().constData(), PROXY_USER_MAX - 1);
+            strncpy(out.password, userInfo.mid(colonIdx + 1).toUtf8().constData(), PROXY_PASS_MAX - 1);
+        } else {
+            strncpy(out.username, userInfo.toUtf8().constData(), PROXY_USER_MAX - 1);
+        }
+    }
+
+    // Parse host:port
+    int lastColon = hostPart.lastIndexOf(':');
+    if (lastColon < 0) return false;
+
+    QString host = hostPart.left(lastColon);
+    bool ok;
+    uint16_t port = hostPart.mid(lastColon + 1).toUShort(&ok);
+    if (!ok || port == 0) return false;
+
+    strncpy(out.host, host.toUtf8().constData(), PROXY_HOST_MAX - 1);
+    out.port = port;
+    out.has_proxy = true;
+
+    return true;
 }

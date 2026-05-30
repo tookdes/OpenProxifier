@@ -125,7 +125,8 @@ void ProxyEngineWrapper::setDnsViaProxy(bool enable)
 }
 
 uint32_t ProxyEngineWrapper::addRule(const QString& process, const QString& hosts,
-                                      const QString& ports, RuleProtocol proto, RuleAction action)
+                                      const QString& ports, RuleProtocol proto, RuleAction action,
+                                      const ProxyInfo* proxy)
 {
     QByteArray processBytes = process.toUtf8();
     QByteArray hostsBytes = hosts.toUtf8();
@@ -135,7 +136,7 @@ uint32_t ProxyEngineWrapper::addRule(const QString& process, const QString& host
         processBytes.constData(),
         hostsBytes.constData(),
         portsBytes.constData(),
-        proto, action);
+        proto, action, proxy);
 
     if (ruleId > 0) {
         ProxyRule rule;
@@ -145,11 +146,21 @@ uint32_t ProxyEngineWrapper::addRule(const QString& process, const QString& host
         rule.ports = ports;
         rule.protocol = proto;
         rule.action = action;
+        if (proxy) {
+            rule.proxy = *proxy;
+        } else {
+            memset(&rule.proxy, 0, sizeof(ProxyInfo));
+        }
         rule.enabled = true;
         m_rules.append(rule);
     }
 
     return ruleId;
+}
+
+bool ProxyEngineWrapper::getGlobalProxy(ProxyInfo* out)
+{
+    return ProxyEngine_GetGlobalProxy(out);
 }
 
 bool ProxyEngineWrapper::removeRule(uint32_t ruleId)

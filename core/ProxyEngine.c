@@ -114,14 +114,38 @@ void ProxyEngine_SetDnsViaProxy(bool enable) {
 }
 
 uint32_t ProxyEngine_AddRule(const char* process, const char* hosts,
-                             const char* ports, RuleProtocol proto, RuleAction action) {
-    uint32_t rule_id = RuleEngine_AddRule(process, hosts, ports, proto, action);
+                             const char* ports, RuleProtocol proto, RuleAction action,
+                             const ProxyInfo* proxy) {
+    uint32_t rule_id = RuleEngine_AddRule(process, hosts, ports, proto, action, proxy);
     if (rule_id > 0) {
         const char* action_str = (action == RULE_ACTION_PROXY) ? "PROXY" :
                                 (action == RULE_ACTION_BLOCK) ? "BLOCK" : "DIRECT";
-        log_message("[ProxyEngine] Rule added: %s -> %s (ID: %u)", process, action_str, rule_id);
+        if (proxy && proxy->has_proxy) {
+            log_message("[ProxyEngine] Rule added: %s -> %s via %s://%s:%u (ID: %u)",
+                process, action_str,
+                (proxy->type == PROXY_TYPE_HTTP) ? "http" : "socks5",
+                proxy->host, proxy->port, rule_id);
+        } else {
+            log_message("[ProxyEngine] Rule added: %s -> %s (ID: %u)", process, action_str, rule_id);
+        }
     }
     return rule_id;
+}
+
+bool ProxyEngine_GetGlobalProxy(ProxyInfo* out) {
+    if (out == NULL) return false;
+    memset(out, 0, sizeof(ProxyInfo));
+    if (g_proxy_host[0] == '\0' || g_proxy_port == 0) {
+        out->has_proxy = false;
+        return false;
+    }
+    out->type = (g_proxy_type == PROXY_TYPE_HTTP) ? PROXY_TYPE_HTTP : PROXY_TYPE_SOCKS5;
+    strncpy(out->host, g_proxy_host, PROXY_HOST_MAX - 1);
+    out->port = g_proxy_port;
+    strncpy(out->username, g_proxy_username, PROXY_USER_MAX - 1);
+    strncpy(out->password, g_proxy_password, PROXY_PASS_MAX - 1);
+    out->has_proxy = true;
+    return true;
 }
 
 bool ProxyEngine_RemoveRule(uint32_t rule_id) {

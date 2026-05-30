@@ -34,6 +34,8 @@ private slots:
     void onAddExeClicked();
     void onRemoveExeClicked();
     void onAuthCheckChanged(int state);
+    void onSetRuleProxyClicked();
+    void onRuleActionChanged(int row, int index);
 
     // Monitoring slots
     void onStartMonitorClicked();
@@ -109,6 +111,8 @@ private:
     void startWinDivertMode();
     void stopWinDivertMode();
     void setupWinDivertConnections();
+    bool parseProxyUrl(const QString& url, ProxyInfo& out);
+    void addRuleRow(const QString& process, RuleAction action, const QString& proxyUrl);
 
     // Settings save/load
     void loadSettings();

@@ -55,11 +55,13 @@ static void print_usage(const char* program) {
     printf("    hosts    - Target IPs (e.g., *, 192.168.*.*)\n");
     printf("    ports    - Target ports (e.g., *, 80, 80;443, 8000-9000)\n");
     printf("    protocol - TCP, UDP, or BOTH\n");
-    printf("    action   - PROXY, DIRECT, or BLOCK\n");
+    printf("    action   - PROXY (use global proxy), DIRECT, BLOCK,\n");
+    printf("               or a proxy URL (socks5://host:port, http://host:port)\n");
     printf("\n");
     printf("Examples:\n");
     printf("  %s --proxy socks5://127.0.0.1:1080 --rule \"chrome.exe:*:*:TCP:PROXY\"\n", program);
-    printf("  %s --proxy socks5://127.0.0.1:1080 --rule \"*:*:*:TCP:PROXY\"\n", program);
+    printf("  %s --rule \"chrome.exe:*:*:TCP:socks5://127.0.0.1:1082\"\n", program);
+    printf("  %s --rule \"firefox.exe:*:*:TCP:socks5://user:pass@127.0.0.1:1083\"\n", program);
     printf("  %s --rule \"malware.exe:*:*:BOTH:BLOCK\"\n", program);
     printf("\n");
 }
@@ -121,20 +123,37 @@ static int parse_proxy(const char* proxy_str, ProxyType* type, char* host, uint1
 
 static int parse_rule(const char* rule_str) {
     // Format: process:hosts:ports:protocol:action
+    // Action can be PROXY/DIRECT/BLOCK or a proxy URL like socks5://host:port
     char rule_copy[1024];
     strncpy(rule_copy, rule_str, sizeof(rule_copy) - 1);
     rule_copy[sizeof(rule_copy) - 1] = '\0';
 
-    char* process = strtok(rule_copy, ":");
-    char* hosts = strtok(NULL, ":");
-    char* ports = strtok(NULL, ":");
-    char* protocol_str = strtok(NULL, ":");
-    char* action_str = strtok(NULL, ":");
+    // Split on first 4 colons (the action field may contain colons from proxy URLs)
+    char* fields[5] = {NULL, NULL, NULL, NULL, NULL};
+    int field_idx = 0;
+    char* p = rule_copy;
 
-    if (!process || !hosts || !ports || !protocol_str || !action_str) {
+    for (int i = 0; i < 4 && *p != '\0'; i++) {
+        fields[i] = p;
+        char* colon = strchr(p, ':');
+        if (colon == NULL) break;
+        *colon = '\0';
+        p = colon + 1;
+    }
+    if (*p != '\0') {
+        fields[4] = p;  // remainder is the action field
+    }
+
+    if (!fields[0] || !fields[1] || !fields[2] || !fields[3] || !fields[4]) {
         printf("[ERROR] Invalid rule format: %s\n", rule_str);
         return -1;
     }
+
+    char* process = fields[0];
+    char* hosts = fields[1];
+    char* ports = fields[2];
+    char* protocol_str = fields[3];
+    char* action_str = fields[4];
 
     RuleProtocol protocol;
     if (_stricmp(protocol_str, "TCP") == 0) {
@@ -149,18 +168,66 @@ static int parse_rule(const char* rule_str) {
     }
 
     RuleAction action;
+    ProxyInfo rule_proxy;
+    memset(&rule_proxy, 0, sizeof(rule_proxy));
+
     if (_stricmp(action_str, "PROXY") == 0) {
         action = RULE_ACTION_PROXY;
+        // No per-rule proxy — will use global
     } else if (_stricmp(action_str, "DIRECT") == 0) {
         action = RULE_ACTION_DIRECT;
     } else if (_stricmp(action_str, "BLOCK") == 0) {
         action = RULE_ACTION_BLOCK;
+    } else if (strncmp(action_str, "socks5://", 9) == 0 ||
+               strncmp(action_str, "http://", 7) == 0) {
+        // Parse as proxy URL
+        action = RULE_ACTION_PROXY;
+        const char* url = action_str;
+        bool is_http = (strncmp(url, "http://", 7) == 0);
+        rule_proxy.type = is_http ? PROXY_TYPE_HTTP : PROXY_TYPE_SOCKS5;
+        const char* after_proto = is_http ? (url + 7) : (url + 9);
+
+        // Parse user:pass@host:port
+        char buf[512];
+        strncpy(buf, after_proto, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+
+        char* at_sign = strchr(buf, '@');
+        char* host_part = buf;
+
+        if (at_sign != NULL) {
+            *at_sign = '\0';
+            host_part = at_sign + 1;
+            char* colon = strchr(buf, ':');
+            if (colon != NULL) {
+                *colon = '\0';
+                strncpy(rule_proxy.username, buf, PROXY_USER_MAX - 1);
+                strncpy(rule_proxy.password, colon + 1, PROXY_PASS_MAX - 1);
+            } else {
+                strncpy(rule_proxy.username, buf, PROXY_USER_MAX - 1);
+            }
+        }
+
+        char* host_colon = strrchr(host_part, ':');
+        if (host_colon == NULL) {
+            printf("[ERROR] Invalid proxy URL (missing port): %s\n", action_str);
+            return -1;
+        }
+        *host_colon = '\0';
+        strncpy(rule_proxy.host, host_part, PROXY_HOST_MAX - 1);
+        rule_proxy.port = (uint16_t)atoi(host_colon + 1);
+        if (rule_proxy.port == 0) {
+            printf("[ERROR] Invalid proxy port in: %s\n", action_str);
+            return -1;
+        }
+        rule_proxy.has_proxy = true;
     } else {
         printf("[ERROR] Invalid action: %s\n", action_str);
         return -1;
     }
 
-    uint32_t rule_id = ProxyEngine_AddRule(process, hosts, ports, protocol, action);
+    uint32_t rule_id = ProxyEngine_AddRule(process, hosts, ports, protocol, action,
+                                           rule_proxy.has_proxy ? &rule_proxy : NULL);
     if (rule_id == 0) {
         printf("[ERROR] Failed to add rule\n");
         return -1;

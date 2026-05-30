@@ -10,11 +10,6 @@
 #pragma comment(lib, "ws2_32.lib")
 
 // External references
-extern char g_proxy_host[256];
-extern uint16_t g_proxy_port;
-extern int g_proxy_type;
-extern char g_proxy_username[64];
-extern char g_proxy_password[64];
 extern LogCallback g_log_callback;
 
 static SOCKET g_listen_socket = INVALID_SOCKET;
@@ -26,6 +21,8 @@ typedef struct {
     SOCKET client_socket;
     uint32_t dest_ip;
     uint16_t dest_port;
+    uint16_t client_port;
+    ProxyInfo proxy;
 } ConnectionContext;
 
 typedef struct {
@@ -80,14 +77,17 @@ static DWORD WINAPI ConnectionHandler(LPVOID arg) {
     SOCKET client_sock = ctx->client_socket;
     uint32_t dest_ip = ctx->dest_ip;
     uint16_t dest_port = ctx->dest_port;
+    uint16_t client_port = ctx->client_port;
+    ProxyInfo proxy = ctx->proxy;
 
     free(ctx);
 
     // Resolve proxy hostname
-    uint32_t proxy_ip = Socks5_ResolveHostname(g_proxy_host);
+    uint32_t proxy_ip = Socks5_ResolveHostname(proxy.host);
     if (proxy_ip == 0) {
-        log_message("[LocalProxy] Failed to resolve proxy host: %s", g_proxy_host);
+        log_message("[LocalProxy] Failed to resolve proxy host: %s", proxy.host);
         closesocket(client_sock);
+        ConnectionTracker_Remove(client_port);
         return 0;
     }
 
@@ -96,29 +96,31 @@ static DWORD WINAPI ConnectionHandler(LPVOID arg) {
     if (proxy_sock == INVALID_SOCKET) {
         log_message("[LocalProxy] Failed to create proxy socket");
         closesocket(client_sock);
+        ConnectionTracker_Remove(client_port);
         return 0;
     }
 
     struct sockaddr_in proxy_addr = {0};
     proxy_addr.sin_family = AF_INET;
     proxy_addr.sin_addr.s_addr = proxy_ip;
-    proxy_addr.sin_port = htons(g_proxy_port);
+    proxy_addr.sin_port = htons(proxy.port);
 
     if (connect(proxy_sock, (struct sockaddr*)&proxy_addr, sizeof(proxy_addr)) == SOCKET_ERROR) {
-        log_message("[LocalProxy] Failed to connect to proxy %s:%d", g_proxy_host, g_proxy_port);
+        log_message("[LocalProxy] Failed to connect to proxy %s:%d", proxy.host, proxy.port);
         closesocket(client_sock);
         closesocket(proxy_sock);
+        ConnectionTracker_Remove(client_port);
         return 0;
     }
 
     // Perform proxy handshake
     int result;
-    if (g_proxy_type == PROXY_TYPE_SOCKS5) {
+    if (proxy.type == PROXY_TYPE_SOCKS5) {
         result = Socks5_Connect(proxy_sock, dest_ip, dest_port,
-                               g_proxy_username, g_proxy_password);
+                               proxy.username, proxy.password);
     } else {
         result = Http_Connect(proxy_sock, dest_ip, dest_port,
-                             g_proxy_username, g_proxy_password);
+                             proxy.username, proxy.password);
     }
 
     if (result != 0) {
@@ -127,6 +129,7 @@ static DWORD WINAPI ConnectionHandler(LPVOID arg) {
             (dest_ip >> 16) & 0xFF, (dest_ip >> 24) & 0xFF, dest_port);
         closesocket(client_sock);
         closesocket(proxy_sock);
+        ConnectionTracker_Remove(client_port);
         return 0;
     }
 
@@ -139,6 +142,7 @@ static DWORD WINAPI ConnectionHandler(LPVOID arg) {
         if (ctx2) free(ctx2);
         closesocket(client_sock);
         closesocket(proxy_sock);
+        ConnectionTracker_Remove(client_port);
         return 0;
     }
 
@@ -153,6 +157,7 @@ static DWORD WINAPI ConnectionHandler(LPVOID arg) {
         free(ctx2);
         closesocket(client_sock);
         closesocket(proxy_sock);
+        ConnectionTracker_Remove(client_port);
         return 0;
     }
 
@@ -164,6 +169,7 @@ static DWORD WINAPI ConnectionHandler(LPVOID arg) {
 
     closesocket(client_sock);
     closesocket(proxy_sock);
+    ConnectionTracker_Remove(client_port);
 
     return 0;
 }
@@ -200,6 +206,14 @@ static DWORD WINAPI LocalProxyThread(LPVOID arg) {
             continue;
         }
 
+        // Get per-connection proxy
+        ProxyInfo conn_proxy;
+        memset(&conn_proxy, 0, sizeof(conn_proxy));
+        if (!ConnectionTracker_GetProxy(client_port, &conn_proxy) || !conn_proxy.has_proxy) {
+            // Fall back to global proxy
+            ProxyEngine_GetGlobalProxy(&conn_proxy);
+        }
+
         // Create connection context
         ConnectionContext* ctx = (ConnectionContext*)malloc(sizeof(ConnectionContext));
         if (ctx == NULL) {
@@ -210,6 +224,8 @@ static DWORD WINAPI LocalProxyThread(LPVOID arg) {
         ctx->client_socket = client_sock;
         ctx->dest_ip = dest_ip;
         ctx->dest_port = dest_port;
+        ctx->client_port = client_port;
+        ctx->proxy = conn_proxy;
 
         // Handle in new thread
         HANDLE conn_thread = CreateThread(NULL, 0, ConnectionHandler, ctx, 0, NULL);
