@@ -2,32 +2,22 @@
 
 [English](README_EN.md) | [中文](README.md)
 
-一个 Windows 透明 SOCKS5 代理工具，可以将目标应用程序的网络连接通过 SOCKS5 代理路由，无需修改目标程序或系统代理设置。
-
-## 演示
-
-![演示](docs/demo.gif)
+Windows 透明 SOCKS5/HTTP 代理工具。将目标应用程序的网络连接通过代理路由，无需修改目标程序或系统代理设置。
 
 ## 功能特性
 
-- **双代理模式**：
-  - **WinDivert 模式**：内核级数据包拦截，实现真正的透明代理（推荐）
-  - **DLL 注入模式**：通过 DLL 注入 Hook Winsock API，兼容旧版应用
-- **规则路由**：为不同应用配置不同规则（代理 / 直连 / 阻止）
-- **进程监控**：自动检测目标进程启动并进行代理
-- **SOCKS5 认证**：完整支持用户名/密码认证（RFC 1929）
-- **连接测试**：启动前测试代理服务器连接和认证
-- **服务器历史**：保存和管理多个代理服务器配置
-- **系统托盘**：最小化到系统托盘，快速访问菜单
-- **内置测试工具**：ProxyTestApp 用于验证代理功能
-- **双语界面**：完整的中英文界面支持
+- **WinDivert 模式**：内核级数据包拦截，实现真正的透明代理
+- **规则路由**：为不同进程配置不同规则（代理 / 直连 / 阻止），支持为每条规则指定独立代理
+- **SOCKS5 & HTTP 代理**：支持 SOCKS5 和 HTTP CONNECT 代理协议
+- **SOCKS5 认证**：支持用户名/密码认证（RFC 1929）
+- **CLI 命令行工具**：无头服务器、服务化部署（如 AlwaysUp）的理想选择
+- **Qt GUI 图形界面**：系统托盘、连接测试、双语界面
+- **DLL 注入模式**：通过 Hook Winsock API 兼容旧版应用
 
 ## 工作原理
 
-### WinDivert 模式（推荐）
-
 ```
-OpenProxifier (Qt GUI)
+OpenProxifier (CLI / GUI)
         |
         | WinDivert 内核驱动
         v
@@ -37,82 +27,122 @@ OpenProxifier (Qt GUI)
         v
 LocalProxy (TCP:34010)
         |
-        | SOCKS5 隧道
+        | SOCKS5/HTTP 隧道
         v
-SOCKS5 代理服务器
-        |
-        v
-      互联网
+代理服务器 --> 互联网
 ```
-
-WinDivert 模式使用 WinDivert 驱动在内核层拦截网络数据包。来自被监控应用程序的数据包被重定向到本地代理，然后通过 SOCKS5 代理隧道传输。这提供了真正的透明代理，无需修改目标应用程序。
-
-### DLL 注入模式
-
-```
-OpenProxifier (Qt GUI)
-        |
-        | 监控 & 注入
-        v
-目标应用程序.exe
-        |
-        | Hook Winsock API
-        v
-OpenProxifierHook.dll
-        |
-        | 重定向连接
-        v
-SOCKS5 代理服务器
-```
-
-DLL 注入模式使用 Microsoft Detours 钩住 Winsock API 调用（`connect`、`WSAConnect`），将 TCP 连接重定向到 SOCKS5 代理。
 
 ## 系统要求
 
 - Windows 10/11（64位）
 - 管理员权限（WinDivert 模式必需）
-- Qt 6.x（用于编译）
-- CMake 3.20+
-- vcpkg（用于 Microsoft Detours）
 
-## 构建方法
+## 快速开始：CLI
 
-1. **通过 vcpkg 安装依赖**：
-   ```batch
-   vcpkg install detours:x64-windows
-   ```
+CLI 是纯 C 程序，无 Qt 依赖，适合服务化部署。
 
-2. **配置并构建**：
-   ```batch
-   cmake -B build -A x64 -DCMAKE_PREFIX_PATH=C:/Qt/6.x/msvc2022_64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
-   cmake --build build --config Release
-   ```
+### 下载
 
-3. **输出文件**位于 `build/bin/Release/`：
-   - `OpenProxifier_x64.exe` - 主程序
-   - `OpenProxifierHook_x64.dll` - 注入模式使用的 Hook DLL
-   - `ProxyTestApp.exe` - 代理测试工具
-   - `WinDivert64.sys` / `WinDivert.dll` - WinDivert 驱动和库
+从 `dist/` 目录获取预编译包 `OpenProxifierCLI-x64.zip`，解压后包含：
+- `OpenProxifierCLI.exe` - 主程序
+- `WinDivert64.sys` / `WinDivert.dll` - WinDivert 驱动
 
-## 使用方法
+### 命令行语法
 
-### 图形界面模式
+```
+OpenProxifierCLI.exe [options]
+```
+
+#### 选项
+
+| 选项 | 说明 |
+|------|------|
+| `--proxy <url>` | 设置代理服务器，格式：`socks5://host:port`、`http://host:port`、`socks5://user:pass@host:port` |
+| `--rule <rule>` | 添加路由规则（可多次使用） |
+| `--dns-direct` | DNS 查询走直连（默认走代理） |
+| `--verbose` | 显示所有连接日志（默认只显示 PROXY/BLOCK） |
+| `-h, --help` | 显示帮助 |
+
+#### 规则格式
+
+```
+进程名:目标IP:目标端口:协议:动作
+```
+
+| 字段 | 说明 | 示例 |
+|------|------|------|
+| 进程名 | 进程文件名，支持通配符 | `chrome.exe`、`*.exe`、`*` |
+| 目标IP | 目标地址，支持通配符 | `*`（全部）、`192.168.*.*` |
+| 目标端口 | 端口号，支持多端口和范围 | `*`、`80`、`80;443`、`8000-9000` |
+| 协议 | `TCP`、`UDP` 或 `BOTH` | `TCP` |
+| 动作 | 见下表 | `PROXY` |
+
+**动作类型：**
+
+| 动作 | 说明 |
+|------|------|
+| `PROXY` | 通过 `--proxy` 指定的全局代理转发 |
+| `DIRECT` | 直连，不走代理 |
+| `BLOCK` | 阻止所有连接 |
+| `socks5://host:port` | 通过指定的 SOCKS5 代理转发（覆盖全局代理） |
+| `http://host:port` | 通过指定的 HTTP 代理转发 |
+
+### 使用示例
+
+**基本用法 - 为特定进程设置代理：**
+```batch
+OpenProxifierCLI.exe --proxy socks5://127.0.0.1:1081 --rule "chrome.exe:*:*:TCP:PROXY"
+```
+
+**多进程 + 多规则：**
+```batch
+OpenProxifierCLI.exe ^
+  --proxy socks5://127.0.0.1:1081 ^
+  --rule "raidrive.mount.exe:*:*:TCP:PROXY" ^
+  --rule "raidrive.mount.service.x64.exe:*:*:TCP:PROXY" ^
+  --rule "update.exe:*:*:TCP:BLOCK"
+```
+
+**为每条规则指定不同的代理：**
+```batch
+OpenProxifierCLI.exe ^
+  --rule "chrome.exe:*:*:TCP:socks5://127.0.0.1:1081" ^
+  --rule "firefox.exe:*:*:TCP:socks5://127.0.0.1:1082"
+```
+
+**带认证的代理：**
+```batch
+OpenProxifierCLI.exe --proxy socks5://user:pass@127.0.0.1:1081 --rule "chrome.exe:*:*:TCP:PROXY"
+```
+
+**仅代理特定端口：**
+```batch
+OpenProxifierCLI.exe --proxy socks5://127.0.0.1:1081 --rule "app.exe:*:80;443:TCP:PROXY"
+```
+
+**代理所有进程：**
+```batch
+OpenProxifierCLI.exe --proxy socks5://127.0.0.1:1081 --rule "*:*:*:TCP:PROXY"
+```
+
+**调试模式（查看所有连接）：**
+```batch
+OpenProxifierCLI.exe --proxy socks5://127.0.0.1:1081 --rule "chrome.exe:*:*:TCP:PROXY" --verbose
+```
+
+## 图形界面（GUI）
+
+GUI 需要 Qt 6.x 环境，提供系统托盘、连接测试、规则管理等功能。
+
+### 使用方法
 
 1. **以管理员身份**启动 `OpenProxifier_x64.exe`
-2. 配置 SOCKS5 代理设置（服务器、端口、可选认证）
+2. 配置 SOCKS5/HTTP 代理设置
 3. 点击"测试连接"验证代理连通性
-4. 添加目标进程名称到规则列表，选择操作：
-   - **代理**：通过 SOCKS5 代理路由
-   - **直连**：直接连接（绕过代理）
-   - **阻止**：阻止所有连接
-5. 点击"开始监控"开始透明代理
-6. 使用"启动测试程序"验证代理是否正常工作
+4. 添加目标进程名称，选择动作（代理 / 直连 / 阻止）
+5. 点击"开始监控"
 
-### 使用示例：为 Antigravity 配置代理
-
-![Antigravity示例](docs/antigravity_example.png)
-
-要让 Antigravity（一款AI编程工具）通过代理上网，需要添加以下三个进程到目标列表：
+### 示例：为 Antigravity 配置代理
 
 | 进程名 | 说明 |
 |--------|------|
@@ -120,98 +150,79 @@ DLL 注入模式使用 Microsoft Detours 钩住 Winsock API 调用（`connect`�
 | `inno_updater.exe` | 更新程序 |
 | `language_server_windows_x64.exe` | 语言服务器 |
 
-配置步骤：
-1. 设置 SOCKS5 代理服务器地址和端口（如 `127.0.0.1:1081`）
-2. 点击"测试连接"确认代理可用
-3. 在"目标进程"列表中依次添加上述三个进程名
-4. 勾选"启动时自动开始监控"（可选）
-5. 点击"开始监控"
+![Antigravity示例](docs/antigravity_example.png)
 
-这样 Antigravity 的所有网络请求都会通过 SOCKS5 代理进行。
+## 从源码构建
 
-### 命令行模式
+### 仅构建 CLI（无需 Qt）
 
 ```batch
-# 通过环境变量设置代理
-set PROXIFIER_PROXY=127.0.0.1:1080
-
-# 注入到指定程序
-ProxifierInjector_x64.exe notepad.exe
-
-# 带认证
-set PROXIFIER_PROXY=127.0.0.1:1080
-set PROXIFIER_USER=用户名
-set PROXIFIER_PASS=密码
-ProxifierInjector_x64.exe curl.exe http://httpbin.org/ip
+cmake -B build_cli -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake --toolchain build_cli.cmake
+cmake --build build_cli --config Release
 ```
+
+输出：`build_cli/Release/OpenProxifierCLI.exe`
+
+### 构建完整项目（CLI + GUI）
+
+需要 Qt 6.x 和 vcpkg（用于 Microsoft Detours）：
+
+```batch
+vcpkg install detours:x64-windows
+cmake -B build -A x64 -DCMAKE_PREFIX_PATH=C:/Qt/6.x/msvc2022_64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
+```
+
+输出文件位于 `build/bin/Release/`：
+- `OpenProxifier_x64.exe` - GUI 主程序
+- `OpenProxifierCLI_x64.exe` - CLI 工具
+- `OpenProxifierHook_x64.dll` - DLL 注入模式 Hook
+- `ProxyTestApp.exe` - 代理测试工具
 
 ## 项目结构
 
 ```
 OpenProxifier/
-├── launcher/           # Qt GUI 应用程序
-│   ├── MainWindow.*    # 主窗口界面和逻辑
-│   ├── ProcessMonitor.*# 进程检测和注入
-│   ├── Injector.*      # DLL 注入实现
-│   └── ProxyEngineWrapper.*  # C++/C 桥接层
-├── core/               # WinDivert 透明代理引擎（C语言）
+├── core/               # WinDivert 透明代理引擎（纯 C）
 │   ├── ProxyEngine.*   # 主引擎接口
 │   ├── PacketProcessor.* # 数据包拦截和 NAT
-│   ├── LocalProxy.*    # 本地 SOCKS5 隧道代理
-│   ├── RuleEngine.*    # 应用程序路由规则
-│   ├── ConnectionTracker.* # NAT 连接跟踪
-│   ├── Socks5.*        # SOCKS5 协议实现
-│   └── UdpRelay.*      # UDP 中继支持
-├── hookdll/            # 注入模式使用的 DLL
-│   ├── HookManager.*   # Hook 安装/移除
-│   ├── WinsockHooks.*  # Winsock API 钩子
-│   └── Socks5Client.*  # SOCKS5 协议实现
-├── proxytestapp/       # 代理测试应用程序
+│   ├── LocalProxy.*    # 本地 SOCKS5/HTTP 隧道代理
+│   ├── RuleEngine.*    # 规则引擎
+│   ├── ConnectionTracker.* # 连接跟踪
+│   ├── ProcessTracker.* # 进程 PID 跟踪
+│   ├── Socks5.*        # SOCKS5 协议
+│   └── UdpRelay.*      # UDP 中继（实验性）
+├── cli/                # CLI 命令行工具（纯 C，无 Qt 依赖）
+├── launcher/           # Qt GUI 应用程序
+│   ├── MainWindow.*    # 主窗口
+│   ├── ProxyEngineWrapper.*  # C++/C 桥接层
+│   ├── Injector.*      # DLL 注入
+│   └── resources/      # 图标、资源文件
+├── hookdll/            # DLL 注入模式 Hook 库
+├── proxytestapp/       # 代理测试应用（Qt）
 ├── common/             # 共享头文件
-│   ├── ProxyConfig.h   # 代理配置结构体
-│   └── SharedMemory.h  # 通过共享内存进行 IPC
-└── cli/                # 命令行工具
+├── windivert/          # WinDivert 驱动和库（x86/x64）
+├── scripts/            # 构建和安装脚本
+├── build_cli.cmake     # CLI 独立构建脚本
+└── docs/               # 文档和截图
 ```
 
 ## 技术细节
 
-### WinDivert 模式
-
-- 使用 WinDivert 2.2 进行内核级数据包捕获
-- 实现双向 NAT 进行透明重定向
-- LocalProxy 监听 TCP 端口 34010
-- 通过 PID 跟踪支持按进程规则匹配
-
-### Hook API（注入模式）
-
-| DLL | 函数 | 用途 |
-|-----|------|------|
-| ws2_32.dll | connect | 重定向 TCP 连接 |
-| ws2_32.dll | WSAConnect | 重定向 TCP 连接（扩展版） |
-| kernel32.dll | CreateProcessW | 注入子进程 |
-| kernel32.dll | CreateProcessA | 注入子进程 |
-
-### SOCKS5 协议支持
-
-- SOCKS5 版本 5（RFC 1928）
-- 无认证（0x00）
-- 用户名/密码认证（0x02，RFC 1929）
-- TCP 连接的 CONNECT 命令
-- 支持 IPv4 和 IPv6 地址
+- WinDivert 2.2 内核级数据包捕获
+- 双向 NAT 透明重定向，LocalProxy 监听 TCP 34010
+- 按进程 PID 匹配规则
+- SOCKS5 (RFC 1928) + 用户名/密码认证 (RFC 1929)
+- HTTP CONNECT 代理支持
 
 ## 已知限制
 
-- WinDivert 模式需要管理员权限
-- 某些带有反调试功能的应用程序可能无法使用注入模式
+- 需要管理员权限
 - UDP 代理为实验性功能
 
 ## 许可证
 
-Apache-2.0（商业友好）
-
-## 贡献
-
-欢迎贡献！请随时提交问题和拉取请求。
+Apache-2.0
 
 ## 致谢
 
